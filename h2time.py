@@ -154,6 +154,7 @@ class H2Request:
         self.method = method
         self.url = self.scheme = self.host = self.port = self.path = self.query = None
         self.set_url(url)
+        self.padding_params = ""
         self.data = data
         self.headers = headers if headers is not None else {}
         self.num_padding_params = 0
@@ -176,18 +177,15 @@ class H2Request:
     def remove_header(self, key: str):
         del self.headers[key]
 
-    def get_request_headers(self):
+    def get_request_headers(self, include_padding_params=False):
         path = self.path
         if self.query != '':
             path += '?' + self.query
-        if self.num_padding_params > 0:
-            path += '?' if self.query == '' else '&'
-            path += self.gen_params()
         headers = [
             (':method', self.method),
             (':authority', self.host),
             (':scheme', self.scheme),
-            (':path', path),
+            (':path', path + (self.padding_params if include_padding_params else '')),
         ]
         for k, v in self.headers.items():
             headers.append((k, v))
@@ -195,6 +193,11 @@ class H2Request:
 
     def set_num_padding_params(self, num: int):
         self.num_padding_params = num
+
+    def create_padding_params(self, num: int):
+        self.set_num_padding_params(num)
+        self.padding_params = "?" if self.query == '' else "&"
+        self.padding_params += self.gen_params()
 
     def gen_params(self):
         exclude_params = parse_qs(self.query).keys()
@@ -209,10 +212,11 @@ class H2Request:
 
 
 class H2Time:
-    def __init__(self, request1: H2Request, request2: H2Request, sequential=True, num_request_pairs=50, inter_request_time_ms=10, num_padding_params=40, timeout=5):
+    def __init__(self, request1: H2Request, request2: H2Request, send_order_pattern="12", sequential=True, num_request_pairs=50, inter_request_time_ms=10, num_padding_params=40, timeout=5):
         self.request1 = request1
         self.request2 = request2
-        self.request1.set_num_padding_params(num_padding_params)
+        self.request1.create_padding_params(num_padding_params)
+        self.request2.create_padding_params(num_padding_params)
         self.scheme = request1.scheme
         self.host = request1.host
         self.port = request1.port
@@ -220,6 +224,7 @@ class H2Time:
         self._settings = {SettingsFrame.HEADER_TABLE_SIZE: 4096}
         self.protocol: H2Protocol = None
         self.sequential = sequential
+        self.send_order_pattern = send_order_pattern
         self.num_request_pairs = num_request_pairs
         self.inter_request_time_ms = inter_request_time_ms
         self.num_padding_params = num_padding_params
@@ -240,10 +245,17 @@ class H2Time:
             await self.protocol.terminate()
             self.protocol = None
 
-    def send_request_pair(self):
-        headers1 = self.request1.get_request_headers()
-        headers2 = self.request2.get_request_headers()
-        stream_id1, stream_id2 = self.protocol.send_request_pair(headers1, headers2, self.request1.data, self.request2.data)
+    def send_request_pair(self, request_number):
+        reverse_order = self.send_order_pattern[request_number % len(self.send_order_pattern)] == '2'
+
+        headers1 = self.request1.get_request_headers(not reverse_order)
+        headers2 = self.request2.get_request_headers(reverse_order)
+
+        if reverse_order:
+            stream_id2, stream_id1 = self.protocol.send_request_pair(headers2, headers1, self.request2.data, self.request1.data)
+        else:
+            stream_id1, stream_id2 = self.protocol.send_request_pair(headers1, headers2, self.request1.data, self.request2.data)
+
         self.sent_requests.append((stream_id1, stream_id2))
 
     @staticmethod
@@ -262,11 +274,11 @@ class H2Time:
         return ctx
 
     async def run_attack(self):
-        for _ in range(self.num_request_pairs):
+        for request_number in range(self.num_request_pairs):
             time.sleep(self.inter_request_time_ms / 1000)
             if not self.protocol.connection_open:
                 break
-            self.send_request_pair()
+            self.send_request_pair(request_number)
             if self.sequential:
                 await self.protocol.wait_for_all_responses(self.timeout)
 
