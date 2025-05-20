@@ -123,7 +123,7 @@ class H2Protocol(asyncio.Protocol):
         return stream1, stream2
 
     def receive_response(self, headers, stream_id):
-        resp_time = time.time_ns()
+        resp_time = time.perf_counter_ns()
         status_headers = list(filter(lambda x: x[0] == b':status', headers))
         status = '-1'
         if len(status_headers) == 1:
